@@ -20,6 +20,7 @@
 #include <gflags/gflags.h>
 #include "butil/fd_utility.h"
 #include "butil/logging.h"                   // CHECK, LOG
+#include "butil/strings/string_piece.h"
 #include "butil/sys_byteorder.h"             // HostToNet,NetToHost
 #include "bthread/bthread.h"
 #include "brpc/errno.pb.h"
@@ -49,7 +50,6 @@ extern bool g_skip_rdma_init;
 
 DEFINE_int32(rdma_sq_size, 128, "SQ size for RDMA");
 DEFINE_int32(rdma_rq_size, 128, "RQ size for RDMA");
-DEFINE_bool(rdma_send_zerocopy, true, "Enable zerocopy for send side");
 DEFINE_bool(rdma_recv_zerocopy, true, "Enable zerocopy for receive side");
 DEFINE_int32(rdma_zerocopy_min_size, 512, "The minimal size for receive zerocopy");
 DEFINE_string(rdma_recv_block_type, "default", "Default size type for recv WR: "
@@ -252,7 +252,9 @@ void RdmaConnect::StartConnect(const Socket* socket,
     }
 }
 
-void RdmaConnect::StopConnect(Socket* socket) { }
+void RdmaConnect::StopConnect(Socket* socket) {
+    LOG(INFO) << "RdmaConnect StopConnect called";
+}
 
 void RdmaConnect::Run() {
     _done(errno, _data);
@@ -272,9 +274,11 @@ static void TryReadOnTcpDuringRdmaEst(Socket* s) {
                 return;
             }
             if (!s->MoreReadEvents(&progress)) {
+                LOG(INFO) << "No more read events";
                 break;
             }
         } else if (nr == 0) {
+            LOG(INFO) << "Got socket EOF, " << *s;
             s->SetEOF();
             return;
         } else {
@@ -331,7 +335,7 @@ void RdmaEndpoint::OnNewDataFromTcp(Socket* m) {
     }
 }
 
-bool HelloNegotiationValid(HelloMessage& msg) {
+bool HelloNegotiationValid(const HelloMessage& msg) {
     if (msg.hello_ver == g_rdma_hello_version &&
         msg.impl_ver == g_rdma_impl_version &&
         msg.block_size >= MIN_BLOCK_SIZE &&
@@ -361,6 +365,7 @@ int RdmaEndpoint::ReadFromFd(void* data, size_t len) {
                     }
                 }
             } else {
+                PLOG(WARNING) << "Failed to read";
                 return -1;
             }
         } else if (nr == 0) {  // Got EOF
@@ -570,9 +575,12 @@ void* RdmaEndpoint::ProcessHandshakeAtServer(void* arg) {
     }
 
     if (memcmp(data, MAGIC_STR, MAGIC_STR_LEN) != 0) {
-        LOG_IF(INFO, FLAGS_rdma_trace_verbose) << "It seems that the "
-            << "client does not use RDMA, fallback to TCP:"
-            << s->description();
+        LOG_IF(INFO, FLAGS_rdma_trace_verbose)
+            << "It seems that the "
+            << "client does not use RDMA, fallback to TCP:" << s->description()
+            << " magic: "
+            << butil::StringPiece(reinterpret_cast<const char*>(data),
+                                  MAGIC_STR_LEN);
         // we need to copy data read back to _socket->_read_buf
         s->_read_buf.append(data, MAGIC_STR_LEN);
         ep->_state = FALLBACK_TCP;
@@ -789,8 +797,11 @@ ssize_t RdmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         window = _window_size.load(butil::memory_order_relaxed);
         if (window == 0) {
             if (total_len > 0) {
+                // Very often
                 break;
             } else {
+                LOG(WARNING) << "total_len=" << total_len
+                             << " current=" << current << " ndata=" << ndata;
                 errno = EAGAIN;
                 return -1;
             }
@@ -802,45 +813,29 @@ ssize_t RdmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         wr.sg_list = sglist;
         wr.opcode = IBV_WR_SEND_WITH_IMM;
 
+        RdmaIOBuf* data = (RdmaIOBuf*)from[current];
         size_t sge_index = 0;
         while (sge_index < (uint32_t)max_sge &&
                 this_len < _remote_recv_block_size) {
-            if (from[current]->size() == 0) {
+            if (data->size() == 0) {
                 // The current IOBuf is empty, find next one
                 ++current;
                 if (current == ndata) {
                     break;
                 }
+                data = (RdmaIOBuf*)from[current];
                 continue;
             }
 
-            ssize_t len = 0;
-            if (FLAGS_rdma_send_zerocopy) {
-                ssize_t len = ((RdmaIOBuf*)from[current])->cut_into_sglist_and_iobuf(
-                        sglist, &sge_index, to, max_sge,
-                        _remote_recv_block_size - this_len);
-                if (len < 0) {
-                    return -1;
-                }
-                this_len += len;
-                total_len += len;
-            } else {
-                len = _remote_recv_block_size - this_len;
-                void* buf = AllocBlock(len);
-                if (!buf) {
-                    return -1;
-                }
-                len = from[current]->copy_to(buf, len);
-                from[current]->cutn(to, len);
-                sglist[sge_index].length = len;
-                sglist[sge_index].addr = (uint64_t)buf;
-                sglist[sge_index].lkey = GetLKey(buf);
-                ++sge_index;
-                this_len += len;
-                total_len += len;
-                _sbuf_data[_sq_current] = buf;
-                break;
+            ssize_t len = data->cut_into_sglist_and_iobuf(
+                sglist, &sge_index, to, max_sge,
+                /*max_len=*/_remote_recv_block_size - this_len);
+            if (len < 0) {
+                return -1;
             }
+            CHECK(len > 0);
+            this_len += len;
+            total_len += len;
         }
         if (this_len == 0) {
             continue;
@@ -968,10 +963,13 @@ ssize_t RdmaEndpoint::HandleCompletion(ibv_wc& wc) {
             uint32_t acks = butil::NetToHost32(wc.imm_data);
             uint32_t num = acks;
             while (num > 0) {
-                if (!FLAGS_rdma_send_zerocopy) {
-                    DeallocBlock(_sbuf_data[_sq_sent]);
-                }
                 _sbuf[_sq_sent++].clear();
+                if ((_sq_current + 1) % (_sq_size - RESERVED_WR_NUM) ==
+                    _sq_sent) {
+                    LOG(FATAL) << "Overflow _sq_sent=" << _sq_sent
+                               << " _sq_current=" << _sq_current
+                               << " RESERVED_WR_NUM=" << RESERVED_WR_NUM;
+                }
                 if (_sq_sent == _sq_size - RESERVED_WR_NUM) {
                     _sq_sent = 0;
                 }
@@ -1050,7 +1048,7 @@ int RdmaEndpoint::PostRecv(uint32_t num, bool zerocopy) {
         if (_rq_received == _rq_size) {
             _rq_received = 0;
         }
-    };
+    }
     return 0;
 }
 
@@ -1146,7 +1144,7 @@ int RdmaEndpoint::AllocateResources() {
         return -1;
     }
 
-    if (ibv_req_notify_cq(_resource->cq, 1) < 0) {
+    if (ibv_req_notify_cq(_resource->cq, /*solicited_only=*/1) < 0) {
         PLOG(WARNING) << "Fail to arm CQ comp channel";
         return -1;
     }
@@ -1157,10 +1155,6 @@ int RdmaEndpoint::AllocateResources() {
     }
     _rbuf.resize(_rq_size);
     if (_rbuf.size() != _rq_size) {
-        return -1;
-    }
-    _sbuf_data.resize(_sq_size, NULL);
-    if (_sbuf_data.size() != _sq_size) {
         return -1;
     }
     _rbuf_data.resize(_rq_size, NULL);
@@ -1192,11 +1186,6 @@ int RdmaEndpoint::BringUpQp(uint16_t lid, ibv_gid gid, uint32_t qp_num) {
         return -1;
     }
 
-    if (PostRecv(_rq_size, true) < 0) {
-        PLOG(WARNING) << "Fail to post recv wr";
-        return -1;
-    }
-
     attr.qp_state = IBV_QPS_RTR;
     attr.path_mtu = IBV_MTU_1024;  // TODO: support more mtu in future
     attr.ah_attr.grh.dgid = gid;
@@ -1223,6 +1212,11 @@ int RdmaEndpoint::BringUpQp(uint16_t lid, ibv_gid gid, uint32_t qp_num) {
                 IBV_QP_DEST_QPN |
                 IBV_QP_RQ_PSN)) < 0) {
         PLOG(WARNING) << "Fail to modify QP from INIT to RTR";
+        return -1;
+    }
+
+    if (PostRecv(_rq_size, true) < 0) {
+        PLOG(WARNING) << "Fail to post recv wr";
         return -1;
     }
 
@@ -1317,7 +1311,8 @@ void RdmaEndpoint::DeallocateResources() {
 static const int MAX_CQ_EVENTS = 128;
 
 int RdmaEndpoint::GetAndAckEvents() {
-    int events = 0; void* context = NULL;
+    int events = 0;
+    void* context = NULL;
     while (1) {
         if (IbvGetCqEvent(_resource->comp_channel, &_resource->cq, &context) < 0) {
             if (errno != EAGAIN) {
@@ -1346,6 +1341,7 @@ void RdmaEndpoint::PollCq(Socket* m) {
 
     SocketUniquePtr s;
     if (Socket::Address(ep->_socket->id(), &s) < 0) {
+        LOG(WARNING) << "Invalid socket";
         return;
     }
     CHECK(ep == s->_rdma_ep);
@@ -1378,11 +1374,13 @@ void RdmaEndpoint::PollCq(Socket* m) {
                 // that the event arrives after the poll but before the notify,
                 // we should re-poll the CQ once after the notify to check if
                 // there is an available CQE.
-                if (ibv_req_notify_cq(ep->_resource->cq, 1) < 0) {
+                if (ibv_req_notify_cq(ep->_resource->cq, /*solicited_only=*/1) <
+                    0) {
                     const int saved_errno = errno;
-                    PLOG(WARNING) << "Fail to arm CQ comp channel: " << s->description();
+                    PLOG(WARNING)
+                        << "Fail to arm CQ comp channel: " << s->description();
                     s->SetFailed(saved_errno, "Fail to arm cq channel from %s: %s",
-                            s->description().c_str(), berror(saved_errno));
+                                s->description().c_str(), berror(saved_errno));
                     return;
                 }
                 notified = true;
@@ -1404,6 +1402,7 @@ void RdmaEndpoint::PollCq(Socket* m) {
         ssize_t bytes = 0;
         for (int i = 0; i < cnt; ++i) {
             if (s->Failed()) {
+                LOG(WARNING) << "Socket failed, " << s->description();
                 continue;
             }
 
@@ -1411,7 +1410,8 @@ void RdmaEndpoint::PollCq(Socket* m) {
                 PLOG(WARNING) << "Fail to handle RDMA completion, error status("
                               << wc[i].status << "): " << s->description();
                 s->SetFailed(ERDMA, "RDMA completion error(%d) from %s: %s",
-                             wc[i].status, s->description().c_str(), berror(ERDMA));
+                             wc[i].status, s->description().c_str(),
+                             berror(ERDMA));
                 continue;
             }
 

@@ -803,6 +803,7 @@ int Socket::WaitAndReset(int32_t expected_nref) {
 
 #if BRPC_WITH_RDMA
     if (_rdma_ep) {
+        LOG(WARNING) << "Reset RdmaEndpoint, " << description();
         _rdma_ep->Reset();
         _rdma_state = RDMA_UNKNOWN;
     }

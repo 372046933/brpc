@@ -113,7 +113,11 @@ ParseResult InputMessenger::CutInputMessage(
             }
 
             if (m->CreatedByConnect()) {
-                if((ProtocolType)cur_index == PROTOCOL_BAIDU_STD) {
+                LOG(INFO) << "cur_index=" << cur_index
+                          << " preferred=" << preferred
+                          << " result.error()=" << result.error()
+                          << " result.error_str()=" << result.error_str();
+                if ((ProtocolType)cur_index == PROTOCOL_BAIDU_STD) {
                     // baidu_std may fall to streaming_rpc.
                     cur_index = (int)PROTOCOL_STREAMING_RPC;
                     continue;
@@ -332,7 +336,7 @@ void InputMessenger::OnNewMessages(Socket* m) {
     // - If the socket has only one message, the message will be parsed and
     //   processed in this bthread. nova-pbrpc and http works in this way.
     // - If the socket has several messages, all messages will be parsed (
-    //   meaning cutting from butil::IOBuf. serializing from protobuf is part of
+    //   meaning cutting from butil::IOBuf. Deserializing from protobuf is part of
     //   "process") in this bthread. All messages except the last one will be
     //   processed in separate bthreads. To minimize the overhead, scheduling
     //   is batched(notice the BTHREAD_NOSIGNAL and bthread_flush).

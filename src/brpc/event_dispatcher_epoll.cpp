@@ -19,6 +19,7 @@
 #ifdef BRPC_SOCKET_HAS_EOF
 #include "brpc/details/has_epollrdhup.h"
 #endif
+#include <sys/epoll.h>
 
 namespace brpc {
 
@@ -28,12 +29,11 @@ EventDispatcher::EventDispatcher()
     , _tid(0)
     , _consumer_thread_attr(BTHREAD_ATTR_NORMAL)
 {
-    _epfd = epoll_create(1024 * 1024);
+    _epfd = epoll_create1(EPOLL_CLOEXEC);
     if (_epfd < 0) {
         PLOG(FATAL) << "Fail to create epoll";
         return;
     }
-    CHECK_EQ(0, butil::make_close_on_exec(_epfd));
 
     _wakeup_fds[0] = -1;
     _wakeup_fds[1] = -1;

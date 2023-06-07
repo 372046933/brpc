@@ -366,7 +366,7 @@ void* AllocBlock(size_t size) {
     }
     for (int i = 0; i < BLOCK_SIZE_COUNT; ++i) {
         if (size <= g_block_size[i]) {
-            return AllocBlockFrom(i);;
+            return AllocBlockFrom(i);
         }
     }
     return NULL;

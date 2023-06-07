@@ -19,15 +19,17 @@
 #define BRPC_RDMA_ENDPOINT_H
 
 #if BRPC_WITH_RDMA
+#include <infiniband/verbs.h>
+
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
-#include <infiniband/verbs.h>
+
+#include "brpc/socket.h"
 #include "butil/atomicops.h"
 #include "butil/iobuf.h"
 #include "butil/macros.h"
-#include "brpc/socket.h"
 
 
 namespace brpc {
@@ -213,8 +215,6 @@ private:
     // Act as sendbuf and recvbuf, but requires no memcpy
     std::vector<butil::IOBuf> _sbuf;
     std::vector<butil::IOBuf> _rbuf;
-    // Data address of _sbuf
-    std::vector<void*> _sbuf_data;
     // Data address of _rbuf
     std::vector<void*> _rbuf_data;
     // Remote block size for receiving
